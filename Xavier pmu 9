@@ -1,0 +1,558 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : 终极融合版 - HSI时钟 + PINN神经网络训练 + 串口输出SVG
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <string.h>
+
+#include "admittance_g.h"
+#include "admittance_b.h"
+#include "electrical_distance.h"
+#include "train_data.h"
+/* USER CODE END Includes */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+#define H1    32
+#define H2    16
+#define N_BUS 33
+#define IN    132
+#define OUT   66
+
+#define V_BIAS      1.0f
+#define THETA_BIAS  0.0f
+#define K_V         0.05f
+#define K_THETA     0.05f
+/* USER CODE END PD */
+
+/* Private variables ---------------------------------------------------------*/
+UART_HandleTypeDef huart1;
+
+/* USER CODE BEGIN PV */
+// --- 全局变量 ---
+float W1[H1][IN], b1[H1], W2[H2][H1], b2[H2], Wout[OUT][H2], bout[OUT];
+float dW1[H1][IN], db1[H1], dW2[H2][H1], db2[H2], dWout[OUT][H2], dbout[OUT];
+float h1_in[H1], h1_out[H1], h2_in[H2], h2_out[H2], raw_out[OUT];
+float V_pred[N_BUS], theta_pred[N_BUS];
+int OBS_LIST[15] = {0, 2, 4, 9, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 30}; // Bus 9 is PMU
+
+// --- 函数原型声明 ---
+static float rand_uniform(void);
+static float sigmoid(float x);
+static float silu(float x);
+static float silu_derivative(float x, float sx);
+void init_weights(void);
+void forward(float* input);
+float compute_physics_loss(float* input);
+void backward_and_update(float* input, float lr, int use_physics, float phys_weight);
+void apply_gradients(float lr);
+void evaluate_accuracy(void);
+
+void plot_voltage_profile_serial(int bus_count, float* V_true, float* V_pred);
+void plot_angle_profile_serial(int bus_count, float* theta_true, float* theta_pred);
+void audit_predictions_serial(void);
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_USART1_UART_Init(void);
+
+/* USER CODE BEGIN 0 */
+// printf 重定向
+int _write(int file, char *ptr, int len) {
+    HAL_UART_Transmit(&huart1, (uint8_t*)ptr, len, HAL_MAX_DELAY);
+    return len;
+}
+
+// ==========================================
+//           PINN 神经网络核心算法区
+// ==========================================
+static float rand_uniform(void) { return ((float)rand() / (float)RAND_MAX) * 2.0f - 1.0f; }
+static float sigmoid(float x) { return (x >= 5.0f) ? 1.0f : ((x <= -5.0f) ? 0.0f : (1.0f / (1.0f + expf(-x)))); }
+static float silu(float x) { return x * sigmoid(x); }
+static float silu_derivative(float x, float sx) { return sx + sigmoid(x) * (1.0f - sx); }
+
+void init_weights(void) {
+    // 纯 Xavier 初始化，不做电气距离引导，也不限制输出层幅度
+    float scale1 = sqrtf(6.0f / (IN + H1));
+    float scale2 = sqrtf(6.0f / (H1 + H2));
+    float scale_out = sqrtf(6.0f / (H2 + OUT));   // 没有 *0.001f
+
+    for (int i = 0; i < H1; i++) {
+        for (int j = 0; j < IN; j++) {
+            W1[i][j] = rand_uniform() * scale1;    // 不再乘电气距离因子
+        }
+        b1[i] = 0.0f;
+    }
+    for (int i = 0; i < H2; i++) {
+        for (int j = 0; j < H1; j++) W2[i][j] = rand_uniform() * scale2;
+        b2[i] = 0.0f;
+    }
+    for (int i = 0; i < OUT; i++) {
+        for (int j = 0; j < H2; j++) Wout[i][j] = rand_uniform() * scale_out;
+        bout[i] = 0.0f;
+    }
+    memset(dW1, 0, sizeof(dW1)); memset(db1, 0, sizeof(db1));
+    memset(dW2, 0, sizeof(dW2)); memset(db2, 0, sizeof(db2));
+    memset(dWout, 0, sizeof(dWout)); memset(dbout, 0, sizeof(dbout));
+}
+
+void forward(float* input) {
+    float scaled_input[IN];
+    for (int j = 0; j < IN; j++) {
+        if (j % 4 == 0 || j % 4 == 1) scaled_input[j] = input[j] * 100.0f;
+        else scaled_input[j] = input[j];
+    }
+
+    for (int i = 0; i < H1; i++) {
+        float s = b1[i];
+        for (int j = 0; j < IN; j++) s += W1[i][j] * scaled_input[j];
+        h1_in[i] = s; h1_out[i] = silu(s);
+    }
+    for (int i = 0; i < H2; i++) { float s = b2[i]; for (int j = 0; j < H1; j++) s += W2[i][j] * h1_out[j]; h2_in[i] = s; h2_out[i] = silu(s); }
+    for (int i = 0; i < OUT; i++) { float s = bout[i]; for (int j = 0; j < H2; j++) s += Wout[i][j] * h2_out[j]; raw_out[i] = s; }
+
+    for (int i = 0; i < N_BUS; i++) {
+        V_pred[i] = V_BIAS + K_V * raw_out[i];
+        theta_pred[i] = THETA_BIAS + K_THETA * raw_out[N_BUS + i];
+    }
+    V_pred[0] = 1.0f; theta_pred[0] = 0.0f;
+}
+
+float compute_physics_loss(float* input) {
+    float loss = 0.0f;
+    for (int i = 1; i < N_BUS; i++) {
+        float P_t = input[i*4 + 0], Q_t = input[i*4 + 1];
+        float P_p = 0.0f, Q_p = 0.0f;
+        for (int k = 0; k < N_BUS; k++) {
+            float dt = theta_pred[i] - theta_pred[k];
+            float cos_d = 1.0f - 0.5f * dt * dt, sin_d = dt;
+            P_p += V_pred[i] * V_pred[k] * (Ybus_G[i][k] * cos_d + Ybus_B[i][k] * sin_d);
+            Q_p += V_pred[i] * V_pred[k] * (Ybus_G[i][k] * sin_d - Ybus_B[i][k] * cos_d);
+        }
+        loss += (P_p - P_t)*(P_p - P_t) + (Q_p - Q_t)*(Q_p - Q_t);
+    }
+    return loss / (N_BUS - 1);
+}
+
+void backward_and_update(float* input, float lr, int use_physics, float phys_weight) {
+    float dV[N_BUS] = {0}, dT[N_BUS] = {0};
+    float scale = 2.0f / (N_BUS - 1);
+
+    if (use_physics) {
+        for (int i = 1; i < N_BUS; i++) {
+            float Vi = V_pred[i], ti = theta_pred[i], P_p = 0.0f, Q_p = 0.0f;
+            for (int k = 0; k < N_BUS; k++) {
+                float dt = ti - theta_pred[k];
+                P_p += Vi * V_pred[k] * (Ybus_G[i][k]*(1.0f-0.5f*dt*dt) + Ybus_B[i][k]*dt);
+                Q_p += Vi * V_pred[k] * (Ybus_G[i][k]*dt - Ybus_B[i][k]*(1.0f-0.5f*dt*dt));
+            }
+            float dp = P_p - input[i*4+0], dq = Q_p - input[i*4+1], dp_dv=0, dq_dv=0, dp_dt=0, dq_dt=0;
+            for (int k = 0; k < N_BUS; k++) {
+                float G = Ybus_G[i][k], B = Ybus_B[i][k], Vk = V_pred[k], dt = ti - theta_pred[k];
+                if (i == k) { dp_dv += 2.0f*Vi*G; dq_dv -= 2.0f*Vi*B; }
+                else { dp_dv += Vk*(G*(1-0.5f*dt*dt)+B*dt); dq_dv += Vk*(G*dt-B*(1-0.5f*dt*dt)); dp_dt += Vi*Vk*(-G*dt+B); dq_dt += Vi*Vk*(G+B*dt); }
+            }
+            dV[i] += phys_weight * scale*(dp*dp_dv + dq*dq_dv);
+            dT[i] += phys_weight * scale*(dp*dp_dt + dq*dq_dt);
+        }
+    }
+
+    float obs_w = 100.0f;
+    for (int j = 0; j < 15; j++) {
+        int idx = OBS_LIST[j]; if(idx==0)continue;
+        dV[idx] += obs_w * 2.0f * (V_pred[idx] - input[idx*4+2]);
+        dT[idx] += obs_w * 100.0f * 2.0f * (theta_pred[idx] - input[idx*4+3]);
+    }
+
+    for (int i=1; i<N_BUS; i++) {
+        if(dV[i] > 1.0f) dV[i] = 1.0f; if(dV[i] < -1.0f) dV[i] = -1.0f;
+        if(dT[i] > 1.0f) dT[i] = 1.0f; if(dT[i] < -1.0f) dT[i] = -1.0f;
+    }
+
+    float dRaw[OUT] = {0};
+    for (int i = 1; i < N_BUS; i++) { dRaw[i] = K_V * dV[i]; dRaw[N_BUS + i] = K_THETA * dT[i]; }
+
+    float dh2[H2] = {0};
+    for (int i = 0; i < OUT; i++) {
+        float grad = dRaw[i];
+        for (int j = 0; j < H2; j++) { dWout[i][j] += grad * h2_out[j]; dh2[j] += grad * Wout[i][j]; }
+        dbout[i] += grad;
+    }
+
+    float dh1[H1] = {0};
+    for (int i = 0; i < H2; i++) {
+        float grad = dh2[i] * silu_derivative(h2_in[i], h2_out[i]);
+        for (int j = 0; j < H1; j++) { dW2[i][j] += grad * h1_out[j]; dh1[j] += grad * W2[i][j]; }
+        db2[i] += grad;
+    }
+
+    float scaled_input[IN];
+    for (int j = 0; j < IN; j++) {
+        if (j % 4 == 0 || j % 4 == 1) scaled_input[j] = input[j] * 100.0f;
+        else scaled_input[j] = input[j];
+    }
+
+    for (int i = 0; i < H1; i++) {
+        float grad = dh1[i] * silu_derivative(h1_in[i], h1_out[i]);
+        for (int j = 0; j < IN; j++) dW1[i][j] += grad * scaled_input[j];
+        db1[i] += grad;
+    }
+}
+
+void apply_gradients(float lr) {
+    for (int i = 0; i < H1; i++) { for (int j = 0; j < IN; j++) { W1[i][j] -= lr * dW1[i][j]; dW1[i][j] = 0.0f; } b1[i] -= lr * db1[i]; db1[i] = 0.0f; }
+    for (int i = 0; i < H2; i++) { for (int j = 0; j < H1; j++) { W2[i][j] -= lr * dW2[i][j]; dW2[i][j] = 0.0f; } b2[i] -= lr * db2[i]; db2[i] = 0.0f; }
+    for (int i = 0; i < OUT; i++) { for (int j = 0; j < H2; j++) { Wout[i][j] -= lr * dWout[i][j]; dWout[i][j] = 0.0f; } bout[i] -= lr * dbout[i]; dbout[i] = 0.0f; }
+}
+
+void evaluate_accuracy(void) {
+    float sum_v = 0, sum_t = 0;
+    float sum_sq_v = 0, sum_sq_t = 0;
+    int count = N_TRAIN_REAL * N_BUS;
+    for (int s = 0; s < N_TRAIN_REAL; s++) {
+        forward((float*)X_train_real[s]);
+        for (int i = 0; i < N_BUS; i++) {
+            float dv = V_pred[i] - X_train_real[s][i*4+2];
+            float dt = theta_pred[i] - X_train_real[s][i*4+3];
+            sum_v += fabsf(dv);
+            sum_t += fabsf(dt);
+            sum_sq_v += dv * dv;
+            sum_sq_t += dt * dt;
+        }
+    }
+    float mae_v = sum_v / count;
+    float mae_t = sum_t / count;
+    float rmse_v = sqrtf(sum_sq_v / count);
+    float rmse_t = sqrtf(sum_sq_t / count);
+    printf("\r\n>>> Xavier对照组 最终精度: V MAE = %.6f, Theta MAE = %.6f\r\n", mae_v, mae_t);
+    printf(">>> RMSE: V RMSE = %.6f, Theta RMSE = %.6f\r\n", rmse_v, rmse_t);
+}
+// 串口输出 SVG (电压)
+void plot_voltage_profile_serial(int bus_count, float* V_true, float* V_pred) {
+    printf("\r\n--- 请复制以下内容保存为 voltage_ppi9.svg ---\r\n");
+    int W = 900, H = 500;
+    float ml = 90, mr = 60, mt = 50, mb = 65;
+    float pw = W - ml - mr, ph = H - mt - mb;
+    float ymin = 0.88f, ymax = 1.05f;
+
+    #define X(i) (ml + pw * (i) / (float)((bus_count > 1) ? (bus_count - 1) : 1))
+    #define Y(v) (mt + ph * (1.0f - ((v) - ymin) / (ymax - ymin)))
+
+    printf("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    printf("<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 %d %d\" width=\"%d\" height=\"%d\">\n", W, H, W, H);
+    printf("<rect width=\"100%%\" height=\"100%%\" fill=\"white\"/>\n");
+    printf("<style> text { font-family: Arial, sans-serif; } </style>\n");
+    printf("<text x=\"%d\" y=\"25\" text-anchor=\"middle\" font-size=\"15\" font-weight=\"bold\" fill=\"black\">"
+             "IEEE 33-Bus Voltage Profile</text>\n", W/2);
+    for (float v = 0.90f; v <= 1.05f + 0.001f; v += 0.05f) {
+        float y = Y(v);
+        printf("<line x1=\"%.1f\" y1=\"%.1f\" x2=\"%.1f\" y2=\"%.1f\" stroke=\"lightgray\" stroke-width=\"0.5\" stroke-dasharray=\"4,4\"/>\n", ml, y, ml + pw, y);
+        printf("<text x=\"%.1f\" y=\"%.1f\" text-anchor=\"end\" font-size=\"11\" fill=\"black\">%.2f</text>\n", ml - 8, y + 4, v);
+    }
+    printf("<text x=\"22\" y=\"%d\" text-anchor=\"middle\" font-size=\"13\" fill=\"black\" transform=\"rotate(-90, 22, %d)\">Voltage (p.u.)</text>\n", (int)(mt + ph/2), (int)(mt + ph/2));
+    for (int i = 0; i < bus_count; i += 2) {
+        float x = X(i);
+        printf("<line x1=\"%.1f\" y1=\"%.1f\" x2=\"%.1f\" y2=\"%.1f\" stroke=\"lightgray\" stroke-width=\"0.5\" stroke-dasharray=\"4,4\"/>\n", x, mt, x, mt + ph);
+        printf("<text x=\"%.1f\" y=\"%.1f\" text-anchor=\"middle\" font-size=\"10\" fill=\"black\">%d</text>\n", x, mt + ph + 18, i);
+    }
+    printf("<text x=\"%d\" y=\"%d\" text-anchor=\"middle\" font-size=\"13\" fill=\"black\">Bus Number</text>\n", (int)(ml + pw/2), H - 15);
+    printf("<line x1=\"%.1f\" y1=\"%.1f\" x2=\"%.1f\" y2=\"%.1f\" stroke=\"black\" stroke-width=\"1.5\"/>\n", ml, mt, ml, mt + ph);
+    printf("<line x1=\"%.1f\" y1=\"%.1f\" x2=\"%.1f\" y2=\"%.1f\" stroke=\"black\" stroke-width=\"1.5\"/>\n", ml, mt + ph, ml + pw, mt + ph);
+    printf("<polyline points=\"");
+    for (int i = 0; i < bus_count; i++) printf("%.1f,%.1f ", X(i), Y(V_true[i]));
+    printf("\" fill=\"none\" stroke=\"black\" stroke-width=\"2.2\" stroke-linejoin=\"round\"/>\n");
+    printf("<polyline points=\"");
+    for (int i = 0; i < bus_count; i++) printf("%.1f,%.1f ", X(i), Y(V_pred[i]));
+    printf("\" fill=\"none\" stroke=\"#0072BD\" stroke-width=\"2.2\" stroke-dasharray=\"8,4\" stroke-linejoin=\"round\"/>\n");
+    int lx = (int)(ml + pw) - 190, ly = (int)mt + 18;
+    printf("<rect x=\"%d\" y=\"%d\" width=\"170\" height=\"52\" fill=\"white\" stroke=\"gray\" stroke-width=\"1\" rx=\"3\"/>\n", lx-8, ly-8);
+    printf("<line x1=\"%d\" y1=\"%d\" x2=\"%d\" y2=\"%d\" stroke=\"black\" stroke-width=\"2.2\"/>\n", lx, ly, lx+28, ly);
+    printf("<text x=\"%d\" y=\"%d\" font-size=\"12\" fill=\"black\">Ground Truth</text>\n", lx+34, ly+4);
+    ly += 25;
+    printf("<line x1=\"%d\" y1=\"%d\" x2=\"%d\" y2=\"%d\" stroke=\"#0072BD\" stroke-width=\"2.2\" stroke-dasharray=\"6,3\"/>\n", lx, ly, lx+28, ly);
+    printf("<text x=\"%d\" y=\"%d\" font-size=\"12\" fill=\"#D95319\">Xavier Prediction</text>\n", lx+34, ly+4);
+    printf("</svg>\n");
+    printf("--- SVG 结束 ---\r\n");
+    #undef X
+    #undef Y
+}
+
+// 串口输出 SVG (相角)
+void plot_angle_profile_serial(int bus_count, float* theta_true, float* theta_pred) {
+    printf("\r\n--- 请复制以下内容保存为 angle_ppi9.svg ---\r\n");
+    int W = 900, H = 500;
+    float ml = 90, mr = 60, mt = 50, mb = 65;
+    float pw = W - ml - mr, ph = H - mt - mb;
+    float tmin = -0.5f, tmax = 0.1f;
+
+    #define X(i) (ml + pw * (i) / (float)((bus_count > 1) ? (bus_count - 1) : 1))
+    #define Y(t) (mt + ph * (1.0f - ((t) - tmin) / (tmax - tmin)))
+
+    printf("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    printf("<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 %d %d\" width=\"%d\" height=\"%d\">\n", W, H, W, H);
+    printf("<rect width=\"100%%\" height=\"100%%\" fill=\"white\"/>\n");
+    printf("<style> text { font-family: Arial, sans-serif; } </style>\n");
+    printf("<text x=\"%d\" y=\"25\" text-anchor=\"middle\" font-size=\"15\" font-weight=\"bold\" fill=\"black\">"
+             "IEEE 33-Bus Phase Angle Profile</text>\n", W/2);
+    for (float t = -0.5f; t <= 0.1f + 0.001f; t += 0.1f) {
+        float y = Y(t);
+        printf("<line x1=\"%.1f\" y1=\"%.1f\" x2=\"%.1f\" y2=\"%.1f\" stroke=\"lightgray\" stroke-width=\"0.5\" stroke-dasharray=\"4,4\"/>\n", ml, y, ml + pw, y);
+        printf("<text x=\"%.1f\" y=\"%.1f\" text-anchor=\"end\" font-size=\"11\" fill=\"black\">%.1f</text>\n", ml - 8, y + 4, t);
+    }
+    printf("<text x=\"22\" y=\"%d\" text-anchor=\"middle\" font-size=\"13\" fill=\"black\" transform=\"rotate(-90, 22, %d)\">Phase Angle (rad)</text>\n", (int)(mt + ph/2), (int)(mt + ph/2));
+    for (int i = 0; i < bus_count; i += 2) {
+        float x = X(i);
+        printf("<line x1=\"%.1f\" y1=\"%.1f\" x2=\"%.1f\" y2=\"%.1f\" stroke=\"lightgray\" stroke-width=\"0.5\" stroke-dasharray=\"4,4\"/>\n", x, mt, x, mt + ph);
+        printf("<text x=\"%.1f\" y=\"%.1f\" text-anchor=\"middle\" font-size=\"10\" fill=\"black\">%d</text>\n", x, mt + ph + 18, i);
+    }
+    printf("<text x=\"%d\" y=\"%d\" text-anchor=\"middle\" font-size=\"13\" fill=\"black\">Bus Number</text>\n", (int)(ml + pw/2), H - 15);
+    printf("<line x1=\"%.1f\" y1=\"%.1f\" x2=\"%.1f\" y2=\"%.1f\" stroke=\"black\" stroke-width=\"1.5\"/>\n", ml, mt, ml, mt + ph);
+    printf("<line x1=\"%.1f\" y1=\"%.1f\" x2=\"%.1f\" y2=\"%.1f\" stroke=\"black\" stroke-width=\"1.5\"/>\n", ml, mt + ph, ml + pw, mt + ph);
+    printf("<polyline points=\"");
+    for (int i = 0; i < bus_count; i++) printf("%.1f,%.1f ", X(i), Y(theta_true[i]));
+    printf("\" fill=\"none\" stroke=\"black\" stroke-width=\"2.2\" stroke-linejoin=\"round\"/>\n");
+    printf("<polyline points=\"");
+    for (int i = 0; i < bus_count; i++) printf("%.1f,%.1f ", X(i), Y(theta_pred[i]));
+    printf("\" fill=\"none\" stroke=\"#D95319\" stroke-width=\"2.2\" stroke-dasharray=\"8,4\" stroke-linejoin=\"round\"/>\n");
+    int lx = (int)(ml + pw) - 210, ly = (int)mt + 18;
+    printf("<rect x=\"%d\" y=\"%d\" width=\"190\" height=\"52\" fill=\"white\" stroke=\"gray\" stroke-width=\"1\" rx=\"3\"/>\n", lx-8, ly-8);
+    printf("<line x1=\"%d\" y1=\"%d\" x2=\"%d\" y2=\"%d\" stroke=\"black\" stroke-width=\"2.2\"/>\n", lx, ly, lx+28, ly);
+    printf("<text x=\"%d\" y=\"%d\" font-size=\"12\" fill=\"black\">Ground Truth</text>\n", lx+34, ly+4);
+    ly += 25;
+    printf("<line x1=\"%d\" y1=\"%d\" x2=\"%d\" y2=\"%d\" stroke=\"#D95319\" stroke-width=\"2.2\" stroke-dasharray=\"6,3\"/>\n", lx, ly, lx+28, ly);
+    // 原来：<text ...>PPI9 Prediction</text>
+    // 改成：
+    printf("<text x=\"%d\" y=\"%d\" font-size=\"12\" fill=\"#0072BD\">Xavier Prediction</text>\n", lx+34, ly+4);
+    printf("</svg>\n");
+    printf("--- SVG 结束 ---\r\n");
+    #undef X
+    #undef Y
+}
+
+// 串口输出 CSV (抽查)
+void audit_predictions_serial(void) {
+    printf("\r\n--- 请复制以下内容保存为 audit_ppi9.csv ---\r\n");
+    printf("Sample,Bus,V_true,V_pred\n");
+    for (int s = 0; s < 5; s++) {
+        forward((float*)X_train_real[s]);
+        for (int i = 0; i < N_BUS; i++) printf("%d,%d,%.6f,%.6f\n", s, i, X_train_real[s][i*4+2], V_pred[i]);
+    }
+    printf("--- CSV 结束 ---\r\n");
+}
+/* USER CODE END 0 */
+
+int main(void)
+{
+    HAL_Init();
+    SystemClock_Config();
+    MX_GPIO_Init();
+    MX_USART1_UART_Init();
+
+    /* USER CODE BEGIN 2 */
+    setvbuf(stdout, NULL, _IONBF, 0);
+    // 💡 等待串口助手连接：闪烁 LED 提示，直到你在串口助手里发送一个字符
+    printf("等待串口助手连接... 请在串口发送任意字符开始训练\r\n");
+    HAL_GPIO_WritePin(GPIOF, GPIO_PIN_6, GPIO_PIN_RESET); // 提示等待
+    while (1) {
+        uint8_t ch;
+        HAL_StatusTypeDef res = HAL_UART_Receive(&huart1, &ch, 1, 100);
+        if (res == HAL_OK) break;  // 收到任意字符就退出
+    }
+
+    // =====================================
+    //          PINN 训练启动
+    // =====================================
+    srand(42);
+    init_weights();
+
+    int epochs = 80;
+    int warmup_epochs = 40;
+    float lr_warmup = 0.001f;
+    float lr_finetune = 0.0005f;
+    float lr = lr_warmup;
+
+    printf("\r\n=========================================\r\n");
+    printf("  运行: 边缘设备分阶段训练开始...\r\n");
+    printf("=========================================\r\n");
+
+    // 训练开始前，红灯常亮提示“正在计算”
+    HAL_GPIO_WritePin(GPIOF, GPIO_PIN_6, GPIO_PIN_RESET);  // 红灯亮
+    HAL_GPIO_WritePin(GPIOF, GPIO_PIN_7, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(GPIOF, GPIO_PIN_8, GPIO_PIN_SET);
+
+    for (int epoch = 0; epoch < epochs; epoch++) {
+        float epoch_phys_loss = 0.0f;
+        float epoch_obs_loss  = 0.0f;
+
+        int use_physics = (epoch >= warmup_epochs) ? 1 : 0;
+        float phys_weight = use_physics ? 0.01f : 0.0f;
+
+        for (int s = 0; s < N_TRAIN_REAL; s++) {
+            forward((float*)X_train_real[s]);
+
+            if (use_physics) {
+                epoch_phys_loss += compute_physics_loss((float*)X_train_real[s]);
+            }
+
+            float obs_loss = 0.0f;
+            for (int j = 0; j < 15; j++) {
+                int idx = OBS_LIST[j];
+                float dv = V_pred[idx] - X_train_real[s][idx*4+2];
+                float dt = theta_pred[idx] - X_train_real[s][idx*4+3];
+                obs_loss += dv*dv + 1000.0f*dt*dt;
+            }
+            epoch_obs_loss += obs_loss / 15.0f;
+
+            backward_and_update((float*)X_train_real[s], lr, use_physics, phys_weight);
+            if ((s + 1) % 32 == 0 || s == N_TRAIN_REAL - 1) {
+                apply_gradients(lr / 32.0f);
+            }
+        }
+
+        if (epoch == warmup_epochs) {
+            lr = lr_finetune;
+            printf("--- 物理损失已激活，学习率降至 %.6f ---\r\n", lr);
+        }
+
+        if ((epoch+1)%10 == 0 || epoch == 0) {
+            printf("Epoch %2d/%d | LR:%.6f | Physics:%s | ObsLoss:%.6f | PhysLoss:%.6f\r\n",
+                   epoch+1, epochs, lr, use_physics ? "ON" : "OFF",
+                   epoch_obs_loss / N_TRAIN_REAL,
+                   use_physics ? epoch_phys_loss / N_TRAIN_REAL : 0.0f);
+        }
+    }
+
+    evaluate_accuracy();
+
+    int s_idx = N_TRAIN_REAL - 1;
+    forward((float*)X_train_real[s_idx]);
+    float vt[33], vp[33], tt[33], tp[33];
+    for(int i = 0; i < 33; i++) {
+        vt[i] = X_train_real[s_idx][i*4 + 2];
+        vp[i] = V_pred[i];
+        tt[i] = X_train_real[s_idx][i*4 + 3];
+        tp[i] = theta_pred[i];
+    }
+
+    // 调用串口绘图函数
+    plot_voltage_profile_serial(33, vt, vp);
+    plot_angle_profile_serial(33, tt, tp);
+    audit_predictions_serial();
+
+    printf("\r\n>>> 训练与输出全部完成！单片机进入待机流水灯模式 <<<\r\n");
+    /* USER CODE END 2 */
+
+    /* Infinite loop */
+    while (1)
+    {
+        /* USER CODE BEGIN 3 */
+        // 训练完成后，流水灯开始跳动
+        HAL_GPIO_WritePin(GPIOF, GPIO_PIN_6, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(GPIOF, GPIO_PIN_7, GPIO_PIN_SET);
+        HAL_GPIO_WritePin(GPIOF, GPIO_PIN_8, GPIO_PIN_SET);
+        HAL_Delay(300);
+
+        HAL_GPIO_WritePin(GPIOF, GPIO_PIN_6, GPIO_PIN_SET);
+        HAL_GPIO_WritePin(GPIOF, GPIO_PIN_7, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(GPIOF, GPIO_PIN_8, GPIO_PIN_SET);
+        HAL_Delay(300);
+
+        HAL_GPIO_WritePin(GPIOF, GPIO_PIN_6, GPIO_PIN_SET);
+        HAL_GPIO_WritePin(GPIOF, GPIO_PIN_7, GPIO_PIN_SET);
+        HAL_GPIO_WritePin(GPIOF, GPIO_PIN_8, GPIO_PIN_RESET);
+        HAL_Delay(300);
+        /* USER CODE END 3 */
+    }
+}
+
+// 以下为初始化函数，保持不变
+void SystemClock_Config(void)
+{
+    RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+    RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+    __HAL_RCC_PWR_CLK_ENABLE();
+    __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+
+    RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+    RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+    RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+    RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+    RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+    RCC_OscInitStruct.PLL.PLLM = 16;
+    RCC_OscInitStruct.PLL.PLLN = 336;
+    RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+    RCC_OscInitStruct.PLL.PLLQ = 4;
+    if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK
+                                | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+    RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+    RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+    RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
+    RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;
+
+    if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_5) != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+
+static void MX_USART1_UART_Init(void)
+{
+    huart1.Instance = USART1;
+    huart1.Init.BaudRate = 115200;
+    huart1.Init.WordLength = UART_WORDLENGTH_8B;
+    huart1.Init.StopBits = UART_STOPBITS_1;
+    huart1.Init.Parity = UART_PARITY_NONE;
+    huart1.Init.Mode = UART_MODE_TX_RX;
+    huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+    huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+    if (HAL_UART_Init(&huart1) != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+
+static void MX_GPIO_Init(void)
+{
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    __HAL_RCC_GPIOF_CLK_ENABLE();
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+
+    HAL_GPIO_WritePin(GPIOF, GPIO_PIN_6 | GPIO_PIN_7 | GPIO_PIN_8, GPIO_PIN_SET);
+
+    GPIO_InitStruct.Pin = GPIO_PIN_6 | GPIO_PIN_7 | GPIO_PIN_8;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOF, &GPIO_InitStruct);
+}
+
+void Error_Handler(void)
+{
+    __disable_irq();
+    while (1) {}
+}
+
+#ifdef USE_FULL_ASSERT
+void assert_failed(uint8_t *file, uint32_t line) {}
+#endif
